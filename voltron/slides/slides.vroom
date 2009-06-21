@@ -1,0 +1,444 @@
+---- center
+Voltron Application Service
+
+by Nicholas Perez (NPEREZ)
+----
+== CAVEATS
+Let's start with some caveats about Voltron:
+
++   * No IKC
++       -> A little too complicated
++       -> No persistent proxy sessions
++   * No PubSub
++       -> Poor choice for handling publishing and subscribing
++       -> No real simple message routing
++ (Didn't figure this out until after my talk was accepted)
+----
+== Outline
+
+    * POE Primer
+        o High level overview of the POE system
+        o Simple examples of usage
+    * What is Voltron?
+        o Overview of the system
+        o Examples
+    * WTF is that AWESOME syntax?
+        o Work in MooseX::Method::Signatures and MooseX::Declare
+        o Tech behind Voltron
+            . POEx::Role::SessionInstantiation
+            . POEx::Role::[TCPServer|TCPClient]
+            . POEx::ProxySession
+* Q&A
+----
+== I can haz POE.
+
+( Some slides, ideas, and info ripped from sungo & BinGOs )
+----
+What is POE?
+
++   * POE is a single-threaded, event driven, cooperative multitasking 
+        environment for Perl. 
+
++   * It provides essential tools for scaling applications with several 
+        important abstractions:
++           -> Kernel
+            -> Sessions
+            -> Wheels
+            -> Filters
+            -> Drivers
+            -> Components
+
+----
+== POE::Kernel
+
++   * An event application kernel
+        o cooperative timeslice process module
+        o provides event loop services to POE::Sessions
+        o comes with its own event loop based on select()
+        o cooperates with four external event loops "out of the box": Gtk, Tk,
+            Event or IO::Poll
+        o other POE::Loops available on CPAN: Wx, Kqueue and Glib
++   * Event services provided by kernel methods
+        o FIFO and Synchronous Events
+        o Delayed Events ( and alarms )
+        o Filehandle Watchers ( Selects ) and Signal Watchers
+        o State Management and Reference Counts
++   * Runs until there are no more events to handle
+
+----
+== Sessions
+
++   * Event driven abstract state machines that encapsulate tasks
++   * Bundles of states
++   * States are registered subroutines or methods
++   * Sessions have resources: a heap, events, filehandles, child sessions 
+        and aliases
++   * Sessions have unique IDs and have a symbolic name 'alias'
++   * Kept 'alive' while they have something to do
+        o Have events pending or delayed events
+        o Have a symbolic name ( alias ) registered
+        o Have active filehandles
+        o Have extra references
+
+----
+== Wheels
+    
++   * Wheels are POE's I/O abstraction layer
++   * Bundle of event handlers
++   * Created by sessions to mutate their behaviour
++   * Must be stored away in the heap or they "disappear"
++   * Some prefabricated Wheels come with POE:
+        o SocketFactory - Non-blocking socket creation
+        o ListenAccept - accept connections from regular listening sockets
+        o ReadWrite - buffered non-blocking IO
+        o ReadLine - terminal input with editing
+        o Run - spawn child process with non-blocking communication
+
+----
+== Filters
+
++   * Implement generic interfaces to low- and medium-level protocols
++   * Turn raw bytes into something useful
++   * Objects that support put() and get()
++   * Should sub-class POE::Filter
++   * Can be switched in Wheels
++   * Can be "stacked" using POE::Filter::Stackable
+
+
+----
+== Components
+
++   * Bundle functionality for use within POE
++   * Typically are made up of Sessions, Wheels, and Filters
++   * Have varying interfaces for interoperability
+
+
+---- perl, i10
+# Some Example Usage
+
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use POE;  # Auto-includes POE::Kernel and POE::Session.
+
+sub handler_start {
+    my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+    print "Session ", $session->ID, " has started.\n";
+    $heap->{count} = 0;
+    $kernel->yield('increment');
+}
+
+sub handler_increment {
+    my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+    print "Session ", $session->ID, " counted to ", ++$heap->{count}, ".\n";
+    $kernel->yield('increment') if $heap->{count} < 10;
+}
+
+sub handler_stop {
+    print "Session ", $_[SESSION]->ID, " has stopped.\n";
+}
+
+for (1..10) {
+    POE::Session->create(
+        inline_states => {
+            _start    => \&handler_start,
+            increment => \&handler_increment,
+            _stop     => \&handler_stop,
+        }
+    );
+}
+
+POE::Kernel->run();
+exit;
+---- perl,i10
+# Some object states
+
+package POE::Component::Foo;
+use 5.010;
+use warnings;
+use strict;
+
+use POE;
+
+sub spawn
+{
+    my ($class, @args) = @_;
+    my $self = {};
+    bless($self, $class);
+
+    POE::Session->create
+    (
+        object_states =>
+        [
+            $self => [ qw/ _start mtfnpy / ]
+        ],
+        args => \@args,
+    );
+
+    return $self;
+}
+
+sub _start
+{
+    my ($kernel, $object, $alias) = @_[KERNEL, OBJECT, ARG0];
+    # do any initialization for the Session
+
+    $kernel->alias_set($alias);
+
+    $kernel->yield('mtfnpy');
+}
+
+sub mtfnpy
+{
+    say 'mtfny';
+}
+
+package main;
+use POE;
+
+POE::Component::Foo->spawn('myalias');
+POE::Kernel->run();
+exit;
+----
+== So what is Voltron?
+
++   * Voltron is a set of components, that when combined can create
+        distributed applications similar to .NET remoting
+
+----
+== What components make up Voltron
+
++A few components make up the system:
++   -> Voltron::Server
++       -> extends POE::ProxySession::Server
++       -> handles application and participant registration
++   -> Voltron::Application
++       -> a role that manages POE::ProxySession::Client for you
++       -> very simple use (only 'requires' participant_[added|removed])
++       -> can connect and service multiple Server end points
++   -> Voltron::Participant
++       -> role that manages POE::ProxySession::Client
++       -> very simple use ('requires' application_[added|removed])
++       -> enforces single server to single application connection
+---- perl,i10
+# Application example
+
+use 5.010;
+use POE;
+use MooseX::Declare;
+
+class MyApplication with Voltron::Application
+{
+    use POEx::Types(':all');
+    use Voltron::Types(':all');
+    use MooseX::Types::Moose(':all');
+
+    use aliased 'POEx::Role::Event';
+    use aliased 'Voltron::Role::VoltronEvent';
+
+    method application_check
+    (
+        Bool :$success, 
+        ServerConnectionInfo :$serverinfo, 
+        Ref :$payload?
+    ) is Event
+    {
+        if($success)
+        {
+            say 'Application registered successfully';
+        }
+        else
+        {
+            die "Application failed to register: $$payload";
+        }
+    }
+
+    method participant_added(Participant :$participant) is Event
+    {
+        say 'Participant ('.$participant->{participant_name}.') added';
+    }
+
+    method participant_removed(Participant :$participant) is Event
+    {
+        say 'Participant ('.$participant->{participant_name}.') removed';
+    }
+
+    method ping(Str $participant_name) is VoltronEvent
+    {
+        say "Received ping from particpant $participant_name";
+        $self->post($participant_name, 'pong', $self->name);
+    }
+}
+
+my $app = MyApplication->new
+(
+    alias                   => 'MyApplication',
+    name                    => 'MyApplication',
+    version                 => 1.00,
+    min_participant_version => 1.00,
+    requires                => { pong => '(Str $application_name)' },
+    options                 => { trace => 0, debug => 1 },
+    server_configs =>
+    [
+        {
+            remote_address  => '127.0.0.1',
+            remote_port     => 12345,
+            return_session  => 'MyApplication',
+            return_event    => 'application_check',
+            server_alias    => 'test_server',
+        }
+    ]
+
+);
+
+POE::Kernel->run();
+
+---- perl,i10
+# Participant example
+use 5.010;
+use POE;
+use MooseX::Declare;
+
+class MyParticipant with Voltron::Participant
+{
+    use POEx::Types(':all');
+    use Voltron::Types(':all');
+    use MooseX::Types::Moose(':all');
+
+    use aliased 'POEx::Role::Event';
+    use aliased 'Voltron::Role::VoltronEvent';
+
+    method participant_check
+    (
+        Bool :$success, 
+        ServerConnectionInfo :$serverinfo, 
+        Ref :$payload?
+    ) is Event
+    {
+        if($success)
+        {
+            say 'Participant registered successfully';
+            $self->yield('fire_ping');
+        }
+        else
+        {
+            die "Participant failed to register: $$payload";
+        }
+    }
+
+    method application_added(Application :$application) is Event
+    {
+        say 'Application added';
+    }
+
+    method application_removed(Application :$application) is Event
+    {
+        say 'Application removed';
+    }
+
+    method fire_ping is Event
+    {
+        $self->post('MyApplication', 'ping', $self->name);
+        $self->poe->kernel->delay_add('fire_ping', 1.0);
+    }
+
+    method pong(Str $application_name) is VoltronEvent
+    {
+        say "Received pong from $application_name";
+    }
+}
+
+my $par = MyParticipant->new
+(
+    alias                   => 'MyParticipant',
+    name                    => 'MyParticipant',
+    application_name        => 'MyApplication',
+    version                 => 1.00,
+    requires                => { ping => '(Str $participant_name)' },
+    options                 => { debug => 1, trace => 0 },
+    server_configs =>
+    [
+        {
+            remote_address  => '127.0.0.1',
+            remote_port     => 12345,
+            return_session  => 'MyParticipant',
+            return_event    => 'participant_check',
+            server_alias    => 'test_server',
+        }
+    ]
+);
+
+
+POE::Kernel->run();
+---- perl,i10
+# What about the server?
+
+use 5.010;
+use POE;
+use Voltron::Server;
+
+Voltron::Server->new
+(
+    listen_ip   => 127.0.0.1,
+    listen_port => 12345,
+    alias       => 'master',
+    options     => { trace => 0, debug => 1 },
+);
+
+POE::Kernel->run();
+----
+== Wait. That compiles? Source Filter?
+
++   * No. No source filters are involved
++   * MooseX::Declare is really awesome
++       o Works by making use of Devel::Declare to define declarators
+            that do magic things at compile time
++       o class, role, method, etc are all declarators
++       o All of the Moose goodness you have come to expect plus some
++           . Role application is deferred until after the class is build
++           . Method advice (around, before, etc) occurs after role composition
+                to allow advising of role methods
++   * MooseX::Method::Signatures does what it says
++       o Yes those are declared types with constraints on those method 
+            arguments
++           . All of the type constraints are validated when the method is 
+                called.
++           . Through more Devel::Declare magic, the arguments are injected in 
+                scope.
++           . You can even make sure the invocant is what you want
+----
+== Wait. That compiles? Source Filter? Part 2.
+
+    * method foo (Str $arg) is SomeRole returns (Int)
++       o "is Event" declares a method trait or role to be applied to the
+            method.
++       o Handy for decorating methods with meaning to something that 
+            introspects on the method later
++       o The roles can even have moose-style constructor arguments
+            (ie. is SomeRole(some_attribute => { key1 => [qw/one two three/]}))
++       o The parameters to the method and the arguments to the method traits
+            are both parsed with much success with PPI
++       o And yes, that is a typed return. The return value of the method will
+            be validated before the caller gets the value.
+
++   * MooseX::Method::Signatures is being integrated into MooseX::Declare
++       o Well, actually, I've already done it, just waiting on rafl to merge
+
+----
+== So how does this Voltron stuff work?
+
++   * It all starts with POEx::Role::SessionInstantiation
++       o It is a role that imbues a class with POE::Session abilities
++       o Along with decorating your methods with POEx::Role::Event it is easy
+            to expose your methods to the POE framework
++       o If something alters your events via POE::Kernel->state(), your 
+            instance of your class gains the method and not the class itself
++   * Then we add POEx::Role::TCPServer|TCPClient
++       o All of the SocketFactory/ReadWrite wheels are bundled up for you
++       o Much simpler than POE::Component::TCP::Server|Client
+
+----
+== So how does this Voltron stuff work? Part 2.
+
++   * And then comes POExProxySession

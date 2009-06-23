@@ -1,9 +1,13 @@
+---- config
+title: Voltron Application Service 
+
 ---- center
 Voltron Application Service
 
 by Nicholas Perez (NPEREZ)
 ----
 == CAVEATS
+
 Let's start with some caveats about Voltron:
 
 +   * No IKC
@@ -19,16 +23,15 @@ Let's start with some caveats about Voltron:
     * POE Primer
         o High level overview of the POE system
         o Simple examples of usage
+    * The tech behind voltron?
+        o POEx::Role::SessionInstantiation
+        o POEx::Role::TCPServer|TCPClient
+        o POEx::ProxySession
     * What is Voltron?
-        o Overview of the system
+        o Overview
         o Examples
-    * WTF is that AWESOME syntax?
-        o Work in MooseX::Method::Signatures and MooseX::Declare
-        o Tech behind Voltron
-            . POEx::Role::SessionInstantiation
-            . POEx::Role::[TCPServer|TCPClient]
-            . POEx::ProxySession
-* Q&A
+        o Shiny but immature
+    * Q&A
 ----
 == I can haz POE.
 
@@ -200,6 +203,261 @@ use POE;
 POE::Component::Foo->spawn('myalias');
 POE::Kernel->run();
 exit;
+----
+== Understanding the tech behind Voltron
+
++   * It all starts with POEx::Role::SessionInstantiation
++       o It is a role that imbues a class with POE::Session abilities
++       o Along with decorating your methods with POEx::Role::Event it is easy
+            to expose your methods to the POE framework
++       o If something alters your events via POE::Kernel->state(), your 
+            instance of your class gains the method and not the class itself
+
+---- perl,i10
+
+use 5.010;
+use MooseX::Declare;
+
+class MySession with POEx::Role::SessionInstantiation
+{
+    use aliased 'POEx::Role::Event';
+
+    after _start is Event
+    {
+        say 'Hooray, we started';
+    }
+
+    before _stop is Event
+    {
+        say 'We are stopping';
+    }
+}
+
+MySession->new();
+POE::Kernel->run();
+
+----
+== Wait. That compiles? Source Filter?
+
++   * No source filters are involved
++   * MooseX::Declare is really awesome
++       o Works by making use of Devel::Declare to define declarators
+            that do magic things at compile time
++       o class, role, method, etc are all declarators
++       o All of the Moose goodness you have come to expect plus some
++           . Role application is deferred until after the class is build
++           . Method advice (around, before, etc) occurs after role composition
+                to allow advising of role methods
++   * MooseX::Method::Signatures does what it says
++       o Yes those are declared types with constraints on those method 
+            arguments
++           . All of the type constraints are validated when the method is 
+                called.
++           . Through more Devel::Declare magic, the arguments are injected in 
+                scope.
++           . You can even make sure the invocant is what you want
+----
+== Wait. That compiles? Source Filter? Part 2.
+
+    * method foo (Str $arg) is SomeRole returns (Int)
++       o "is Event" declares a method trait or role to be applied to the
+            method.
++       o Handy for decorating methods with meaning to something that 
+            introspects on the method later
++       o The roles can even have moose-style constructor arguments
+            (ie. is SomeRole(some_attribute => { key1 => [qw/one two three/]}))
++       o The parameters to the method and the arguments to the method traits
+            are both parsed with much success with PPI
++       o And yes, that is a typed return. The return value of the method will
+            be validated before the caller gets the value.
+
++   * MooseX::Method::Signatures is being integrated into MooseX::Declare
++       o Well, actually, I've already done it, just waiting on rafl to merge
+
+----
+== Back to the tech
+
++   * Then we add POEx::Role::TCPServer|TCPClient
++       o All of the SocketFactory/ReadWrite wheels are bundled up for you
++       o Much simpler than POE::Component::TCP::Server|Client
+
+---- perl,i10
+
+use 5.010;
+use MooseX::Declare;
+
+class MyServer with POEx::Role::TCPServer
+{
+    use POEx::Types(':all');
+    use aliased 'POEx::Role::Event';
+
+    method handle_inbound_data(Str $data, WheelID $id) is Event
+    {
+        say "We got data '$data' from client '$id'";
+        $self->get_wheel($id)->put('bar');
+    }
+}
+
+class MyClient with POEx::Role::TCPClient
+{
+    use POEx::Types(':all');
+    use aliased 'POEx::Role::Event';
+    
+    after _start is Event
+    {
+        $self->yield
+        (
+            'connect', 
+            remote_address  => '127.0.0.1',
+            remote_port     => 24681,
+        );
+    }
+
+    method handle_inbound_data(Str $data, WheelID $id) is Event
+    {
+        say "We got data '$data' from server '$id'";
+    }
+
+    after handle_on_connect(GlobRef $socket, Str $remote_address, Int $remote_port, WheelID $id) is Event
+    {
+        $self->get_wheel($self->last_wheel)->put('foo');
+    }
+}
+
+MyServer->new
+(
+    listen_ip => '127.0.0.1',
+    listen_port => 24681,
+);
+
+MyClient->new() for 0..5;
+
+POE::Kernel->run();
+----
+== Next layer of tech
+
++   * And then comes POEx::ProxySession
++       o POEx::ProxySesion::Server
++           . central point for end points to which they connect
++           . retain published session metadata
++           . delivers messages
++       o POEx::ProxySession::Client
++           . acts as the interface to proxying
++           . publishes session meta data and also subscribes
++           . creates local proxies that sends messages to the Server
+
+
+---- perl,i10
+# Example
+use 5.010;
+use MooseX::Declare;
+
+class Mtfnpy with POEx::Role::SessionInstantiation
+{
+    use POEx::ProxySession::Client;
+    use MooseX::Types::Moose(':all');
+    use POEx::Types(':all');
+
+    use aliased 'POEx::Role::Event';
+    use aliased 'POEx::Role::ProxyEvent';
+    
+    has proxyclient => 
+    (
+        is => 'ro', 
+        isa => Object, 
+        default => sub 
+        {
+            POEx::ProxySession::Client->new(alias => 'pxps', options => { trace => 0 }) 
+        } 
+    );
+
+    after _start is Event
+    {
+        $self->post
+        (
+            'pxps', 'connect',
+            remote_address  => '127.0.0.1',
+            remote_port     => 54321,
+            return_event    => 'post_connect'
+        );
+    }
+
+    method post_connect
+    (
+        WheelID :$connection_id,
+        Str :$remote_address,
+        Int :$remote_port,
+        Maybe[Ref] :$tag!
+    ) is Event
+    {
+        $self->post
+        (
+            'pxps', 'publish',
+            connection_id   => $connection_id,
+            session_alias   => 'mtfnpy_remote',
+            session         => $self,
+            return_event    => 'check_publish',
+        );
+    }
+
+    method check_publish
+    (
+        WheelID :$connection_id, 
+        Bool :$success, 
+        SessionAlias :$session_alias, 
+        Ref :$payload?, 
+        Maybe[Ref] :$tag!
+    ) is Event
+    {
+        if ($success)
+        {
+            $self->post
+            (
+                'pxps', 'subscribe',
+                connection_id   => $connection_id,
+                to_session      => $session_alias,
+                return_event    => 'check_subscribe',
+            );
+        }
+    }
+
+    method check_subscribe
+    (
+        WheelID :$connection_id, 
+        Bool :$success, 
+        SessionAlias :$session_name, 
+        Ref :$payload, 
+        Maybe[Ref] :$tag!
+    ) is Event
+    {
+        if ($success)
+        {
+            say "Posting to $session_name : flarg";
+            $self->post($session_name, 'flarg', 3, 'woohoo');
+        }
+    }
+
+    method flarg(Int $arg1, Str $arg2) is ProxyEvent
+    {
+        say "My context: $self";
+        say "Hooray for '$arg1' and '$arg2'";
+    }
+}
+
+use POEx::ProxySession::Server;
+
+POEx::ProxySession::Server->new
+(
+    listen_ip => '127.0.0.1',
+    listen_port => 54321,
+    alias => 'server',
+    options => { trace => 0 },
+);
+
+Mtfnpy->new(alias => 'mtfnpy', options => { trace => 0 });
+
+POE::Kernel->run();
+
 ----
 == So what is Voltron?
 
@@ -380,7 +638,7 @@ use Voltron::Server;
 
 Voltron::Server->new
 (
-    listen_ip   => 127.0.0.1,
+    listen_ip   => '127.0.0.1',
     listen_port => 12345,
     alias       => 'master',
     options     => { trace => 0, debug => 1 },
@@ -388,57 +646,20 @@ Voltron::Server->new
 
 POE::Kernel->run();
 ----
-== Wait. That compiles? Source Filter?
+== Shiny but not very mature
 
-+   * No. No source filters are involved
-+   * MooseX::Declare is really awesome
-+       o Works by making use of Devel::Declare to define declarators
-            that do magic things at compile time
-+       o class, role, method, etc are all declarators
-+       o All of the Moose goodness you have come to expect plus some
-+           . Role application is deferred until after the class is build
-+           . Method advice (around, before, etc) occurs after role composition
-                to allow advising of role methods
-+   * MooseX::Method::Signatures does what it says
-+       o Yes those are declared types with constraints on those method 
-            arguments
-+           . All of the type constraints are validated when the method is 
-                called.
-+           . Through more Devel::Declare magic, the arguments are injected in 
-                scope.
-+           . You can even make sure the invocant is what you want
++   * I had the idea a couple of months ago
++   * I didn't finish until last week
++   * Some error states are not accounted for
++   * More of a proof of concept
++   * Dependent upon lots of experimental features of 
+        MooseX::Declare and MooseX::Method::Signatures
 ----
-== Wait. That compiles? Source Filter? Part 2.
+== Shiny but not very mature
 
-    * method foo (Str $arg) is SomeRole returns (Int)
-+       o "is Event" declares a method trait or role to be applied to the
-            method.
-+       o Handy for decorating methods with meaning to something that 
-            introspects on the method later
-+       o The roles can even have moose-style constructor arguments
-            (ie. is SomeRole(some_attribute => { key1 => [qw/one two three/]}))
-+       o The parameters to the method and the arguments to the method traits
-            are both parsed with much success with PPI
-+       o And yes, that is a typed return. The return value of the method will
-            be validated before the caller gets the value.
-
-+   * MooseX::Method::Signatures is being integrated into MooseX::Declare
-+       o Well, actually, I've already done it, just waiting on rafl to merge
+    * But it pushed development of its dependencies
+    * Gave rise to a different method of POE + Moose usage
+    * And also showed some odd corner cases in Moose to be addressed
 
 ----
-== So how does this Voltron stuff work?
-
-+   * It all starts with POEx::Role::SessionInstantiation
-+       o It is a role that imbues a class with POE::Session abilities
-+       o Along with decorating your methods with POEx::Role::Event it is easy
-            to expose your methods to the POE framework
-+       o If something alters your events via POE::Kernel->state(), your 
-            instance of your class gains the method and not the class itself
-+   * Then we add POEx::Role::TCPServer|TCPClient
-+       o All of the SocketFactory/ReadWrite wheels are bundled up for you
-+       o Much simpler than POE::Component::TCP::Server|Client
-
-----
-== So how does this Voltron stuff work? Part 2.
-
-+   * And then comes POExProxySession
+== QUESTIONS?

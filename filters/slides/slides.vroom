@@ -1,0 +1,438 @@
+---- config
+title: Protocol Abstraction via POE::Filter
+
+---- center
+Protocol Abstraction via POE::Filter
+
+by Nicholas Perez (NPEREZ)
+----
+== Outline
+
+    * POE Primer
+        o High level overview of the POE system
+        o Simple examples of usage
+    * Dissecting XMLRPC
+        o HTTP
+        o XML
+        o XMLRPC
+    * POE::Filter indepth
+        o POE::Filter::SimpleHTTP
+        o POE::Filter::XML
+        o POE::Filter::XML::RPC
+    * Putting it all together
+    * Q&A
+
+    (P.S. You can access all of the examples and the master slide document
+        via github.com/nperez/yapc_na_2009)
+    (P.P.S The final example is kinda long, so you need to follow along on your
+        own machine or your neighbors)
+----
+== I can haz POE.
+
+( Some slides, ideas, and info ripped from sungo & BinGOs )
+----
+What is POE?
+
++   * POE is a single-threaded, event driven, cooperative multitasking 
+        environment for Perl. 
+
++   * It provides essential tools for scaling applications with several 
+        important abstractions:
++           -> Kernel
+            -> Sessions
+            -> Wheels
+            -> Filters
+            -> Drivers
+            -> Components
+
+----
+== POE::Kernel
+
++   * An event application kernel
+        o cooperative timeslice process module
+        o provides event loop services to POE::Sessions
+        o comes with its own event loop based on select()
+        o cooperates with four external event loops "out of the box": Gtk, Tk,
+            Event or IO::Poll
+        o other POE::Loops available on CPAN: Wx, Kqueue and Glib
++   * Event services provided by kernel methods
+        o FIFO and Synchronous Events
+        o Delayed Events ( and alarms )
+        o Filehandle Watchers ( Selects ) and Signal Watchers
+        o State Management and Reference Counts
++   * Runs until there are no more events to handle
+
+----
+== Sessions
+
++   * Event driven abstract state machines that encapsulate tasks
++   * Bundles of states
++   * States are registered subroutines or methods
++   * Sessions have resources: a heap, events, filehandles, child sessions 
+        and aliases
++   * Sessions have unique IDs and have a symbolic name 'alias'
++   * Kept 'alive' while they have something to do
+        o Have events pending or delayed events
+        o Have a symbolic name ( alias ) registered
+        o Have active filehandles
+        o Have extra references
+
+----
+== Wheels
+    
++   * Wheels are POE's I/O abstraction layer
++   * Bundle of event handlers
++   * Created by sessions to mutate their behaviour
++   * Must be stored away in the heap or they "disappear"
++   * Some prefabricated Wheels come with POE:
+        o SocketFactory - Non-blocking socket creation
+        o ListenAccept - accept connections from regular listening sockets
+        o ReadWrite - buffered non-blocking IO
+        o ReadLine - terminal input with editing
+        o Run - spawn child process with non-blocking communication
+
+----
+== Filters
+
++   * Implement generic interfaces to low- and medium-level protocols
++   * Turn raw bytes into something useful
++   * Objects that support put() and get()
++   * Should sub-class POE::Filter
++   * Can be switched in Wheels
++   * Can be "stacked" using POE::Filter::Stackable
+
+
+----
+== Components
+
++   * Bundle functionality for use within POE
++   * Typically are made up of Sessions, Wheels, and Filters
++   * Have varying interfaces for interoperability
+
+
+---- perl, i10
+# Some Example Usage
+
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use POE;  # Auto-includes POE::Kernel and POE::Session.
+
+sub handler_start {
+    my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+    print "Session ", $session->ID, " has started.\n";
+    $heap->{count} = 0;
+    $kernel->yield('increment');
+}
+
+sub handler_increment {
+    my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+    print "Session ", $session->ID, " counted to ", ++$heap->{count}, ".\n";
+    $kernel->yield('increment') if $heap->{count} < 10;
+}
+
+sub handler_stop {
+    print "Session ", $_[SESSION]->ID, " has stopped.\n";
+}
+
+for (1..10) {
+    POE::Session->create(
+        inline_states => {
+            _start    => \&handler_start,
+            increment => \&handler_increment,
+            _stop     => \&handler_stop,
+        }
+    );
+}
+
+POE::Kernel->run();
+exit;
+---- perl,i10
+# Some object states
+
+package POE::Component::Foo;
+use 5.010;
+use warnings;
+use strict;
+
+use POE;
+
+sub spawn
+{
+    my ($class, @args) = @_;
+    my $self = {};
+    bless($self, $class);
+
+    POE::Session->create
+    (
+        object_states =>
+        [
+            $self => [ qw/ _start mtfnpy / ]
+        ],
+        args => \@args,
+    );
+
+    return $self;
+}
+
+sub _start
+{
+    my ($kernel, $object, $alias) = @_[KERNEL, OBJECT, ARG0];
+    # do any initialization for the Session
+
+    $kernel->alias_set($alias);
+
+    $kernel->yield('mtfnpy');
+}
+
+sub mtfnpy
+{
+    say 'mtfnpy';
+}
+
+package main;
+use POE;
+
+POE::Component::Foo->spawn('myalias');
+POE::Kernel->run();
+exit;
+----
+== Dissecting XMLRPC
+
++   * XML-RPC is a Remote Procedure Calling protocol that 
+        works over the Internet.
++   * Uses HTTP as a transport
++   * Uses XML as the body to define a message
++   * Has a simplified serialization format for data
++   * Servers handle requests and return payloads in XML
+
+----
+== Requests
+
++   * The request must be a POST
++   * The URI is not specified and is up to the server to handle route it
++   * A User-Agent and Host must be specified.
++   * The Content-Type is text/xml.
++   * The Content-Length must be specified and must be correct.
+
+----
+== Requests
+
+    * The payload format is rather simple:
++   * Is in XML, a single <methodCall> structure.
++   * <methodCall> must contain a <methodName>.
++   * <methodCall> can also contain a <params>
++   * <params> holds <param> tags
++   * <param> only has one <value> tag.
+
+----
+== Example Request Payload
+
+    <methodCall>
+        <methodName>foo</methodName>
+        <params>
+            <param>
+                <value>
+                    <int>42</int>
+                </value>
+            </param>
+        </params>
+    </methodCall>
+----
+== Values
+
+    * There are a few valid tags that can be under <value>
++   * <int> 4-byte signed integer
++   * <bool> 0 = false, 1 = true
++   * <string> any valid, encoded string (< to &lt; etc)
++   * <double> double precision signed floating point number
++   * <dateTime.iso8601> DateTime in iso8601 format (19980717T14:08:55)
++   * <base64> Base64 encoded data
+
+----
+== Values
+
+    * <array> has one <data> element which has any number of <value>s.
++   * <struct> has any number of <member>s which have one <name>, one <value>
+
++   * Arrays and Structs can nest without problems as deep as needed
+
+----
+== Array Example
+
+    <value>
+        <array>
+            <data>
+                <value>
+                    <int>1</int>
+                </value>
+                <value>
+                    <int>2</int>
+                </value>
+                <value>
+                    <int>3</int>
+                </value>
+            </data>
+        </array>
+    </value>
+
+----
+== Struct Example
+
+    <value>
+        <struct>
+            <member>
+                <name>key1</name>
+                <value>
+                    <int>6</int>
+                </value>
+            </member>
+            <member>
+                <name>key2</name>
+                <value>
+                    <int>9</int>
+                </value>
+            </member>
+        </struct>
+    </value>
+
+----
+== Response
+
++   * Unless there's a lower-level error, always return 200 OK
++   * The Content-Type is text/xml. Content-Length must be present and correct.
++   * Payload format is simple:
++       o Single XML structure -- <methodResponse>, which can contains
+            a single <params> which contains a single <param> which 
+            contains a single <value>.
++   * Also, instead of a <params>, may instead contain a single <fault>
+        which contains a single <value> which must be a <struct> with
+        two members:
++       o faultCode: must be an <int>
++       o faultString: must be a <string>
+
+----
+== Response Example (success)
+
+    <methodResponse>
+        <params>
+            <param>
+                <value>
+                    <string>FFFFFFUUUUUUUU-</string>
+                </value>
+            </param>
+        </params>
+    </methodResponse>
+
+----
+== Response Example (fault)
+
+    <methodResponse>
+        <fault>
+            <value>
+                <struct>
+                    <member>
+                        <name>faultCode</name>
+                        <value><int>403</int></value>
+                    </member>
+                    <member>
+                        <name>faultString</name>
+                        <value><string>Forbidden fruit.</string></value>
+                    </member>
+                </struct>
+            </value>
+        </fault>
+    </methodResponse>
+
+----
+== POE::Filter indepth
+
++   * The ultimate goal of a filter is to take line noise and 
+        turn it into something useful.
++   * So let's start with HTTP
+
+----
+== POE::Filter::SimpleHTTP
+
++   * Handles both client and server modes of operation
++   * put() can take raw data and construct HTTP::Message objects
++   * can alter its configuration at runtime via Moose accessors
++   * Regex based
++   * handles tranfer-encodings including compression
+
++   ( On a side note, CPAN really really needs an RFC BNF-to-Regex module )
+
++   Now on to the XML
+----
+== POE::Filter::XML
+
++   * Is mainly used for streaming XML applications (XMPP, 
+        see POE::Component::Jabber)
++   * But also has a non-streaming mode of operation
+
++   * As of version 3.00, is based on XML::LibXML
++       o Returns POE::Filter::XML::Nodes (subclass of XML::LibXML::Element)
++       o Gives us XPATH support on a per node basis
+
++   * Now to interpret the XML objects
+----
+== POE::Filter::XML::RPC
+
++   * Kind of misnamed
++       o Doesn't really subclass, but instead operates on 
+            POE::Filter::XML::Nodes
++   * Gives proper Response, Request, Fault, and Value objects
++   * The value objects use some heuristics to auto-marshal data
++   * When creating, can use hints
++   * When receiving, will introspect the data to give you a type
+
++   * We have the pieces, but no glue...
+----
+== POE::Filter:Stackable
+
++   * Implements the POE::Filter interface
++   * Stores other filters in a stack (duh)
++   * Data and results are chained through each filter in the stack
++   * Has an api to allow runtime editing of filters
+
++   * Closer, but how do we go from HTTP::Message objects to just their
+        content?
+----
+== POE::Filter::Map
+
++   * The tactical nuke in the POE::Filter arsenal
++   * Yes, it really does use map
++   * Can transform Put and Get individually
+
++   * We now have a complete solution, but what does it look like?
+
+----
+== Follow along at home
+
++   * For now, please ignore all of the magical syntax
++   * If you are curious, come see my talk tomorrow on Voltron
++   * I am at least assuming prior Moose knowledge on your part
+
+----
+== Follow along at home
+
++   * filters/code/lib/XMLRPC/Server.pm
++       o Each filter is built via attribute defaults
++       o Except for Stackable and that gets a builder
++       o Notice the explicit ordering on the call to push()
++       o handle_inbound_data has all of the magic
+
+----
+== Follow along at home
+
++   * filters/code/server.pl
++       o Simply write the methods and decorate them to expose them
+
+----
+== Let's run it
+
++   * I'm just gonna use XMLRPCsh.pl because I was too lazy to write a client
+
+----
+== QA
